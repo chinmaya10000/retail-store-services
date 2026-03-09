@@ -1,0 +1,118 @@
+name: Build and Push to ECR
+
+on:
+  push:
+    branches: [ main ]
+    paths: ['src/**']
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  AWS_ROLE_ARN: arn:aws:iam::973605817967:role/github-actions
+  
+jobs:
+  detect-changes:
+    name: Detect Changed Services
+    runs-on: ubuntu-latest
+    outputs:
+      changed-services: ${{ steps.changes.outputs.changed-services }}
+      matrix: ${{ steps.changes.outputs.matrix }}
+      has-changes: ${{ steps.changes.outputs.has-changes }}
+    
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        fetch-depth: 2
+    
+    - name: Detect changed services
+      id: changes 
+      run: |
+        SERVICES=("ui" "catalog" "cart" "checkout" "orders")
+        CHANGED_SERVICES=()
+
+        echo "🔍 Checking for changes in services..."
+
+        # Check for changes in each service
+        for service in "${SERVICES[@]}"; do
+          if git diff --name-only HEAD~1 HEAD | grep -q "^src/$service/" || [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            CHANGED_SERVICES+=("$service")
+            echo "✅ Changes detected in: $service"
+          else
+            echo "❌ No changes in: $service"
+          fi
+        done 
+
+        # If manual trigger, build all services 
+        if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+          echo "🔄 Manual trigger - building all services"
+          CHANGED_SERVICES=("ui" "catalog" "cart" "checkout" "orders")
+        fi
+
+        # Check if we have any changes
+        if [ ${#CHANGED_SERVICES[@]} -eq 0 ]; then
+          echo "❌ No services changed"
+          echo "has-changes=false" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+
+        # Create matrix for changed services only
+        MATRIX_JSON="["
+        for i in "${!CHANGED_SERVICES[@]}"; do
+          if [ $i -gt 0 ]; then
+            MATRIX_JSON+=","
+          fi
+          MATRIX_JSON+="\"${CHANGED_SERVICES[$i]}\""
+        done
+        MATRIX_JSON+="]"
+
+        echo "changed-services=${CHANGED_SERVICES[*]}" >> $GITHUB_OUTPUT
+        echo "matrix={\"service\":$MATRIX_JSON}" >> $GITHUB_OUTPUT
+        echo "has-changes=true" >> $GITHUB_OUTPUT
+          
+        echo "📊 Services to build: ${CHANGED_SERVICES[*]}"
+        echo "📊 Generated matrix: {\"service\":$MATRIX_JSON}"
+
+  build-and-push:
+    name: Build ${{ matrix.service }}
+    needs: detect-changes
+    runs-on: ubuntu-latest
+    if: needs.detect-changes.outputs.has-changes == 'true'
+
+    permissions:
+      id-token: write   # Required for OIDC
+      contents: read
+
+    strategy:
+      matrix: ${{ fromJson(needs.detect-changes.outputs.matrix) }}
+      fail-fast: false
+
+    steps:
+    - uses: actions/checkout@v6
+
+    # 🔐 Recommended: OIDC Role (More Secure)
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v6.0.0
+      with:
+        audience: sts.amazonaws.com.cn
+        aws-region: ${{ env.AWS_REGION }}
+        role-to-assume: ${{ env.AWS_ROLE_ARN }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build, tag, and push Docker image
+      env:
+        REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        SERVICE_NAME: ${{ matrix.service }}
+        IMAGE_TAG: ${{ github.sha }}
+      run: |
+        REPOSITORY="retail-store/${SERVICE_NAME}"
+        SHORT_TAG=$(echo $IMAGE_TAG | cut -c1-7)
+
+        echo "🚀 Building $REPOSITORY:$SHORT_TAG"
+
+        docker build -t $REGISTRY/$REPOSITORY:$SHORT_TAG src/$SERVICE_NAME
+        docker push $REGISTRY/$REPOSITORY:$SHORT_TAG
+
+        echo "✅ Pushed $REGISTRY/$REPOSITORY:$SHORT_TAG"
